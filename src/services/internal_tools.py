@@ -32,6 +32,20 @@ except ImportError:
     _IN_IDA = False
 
 
+# Callback registry for document chat creation
+_document_chat_handler = None
+
+
+def set_document_chat_handler(handler):
+    """Register a callback for creating document chats.
+
+    Args:
+        handler: Callable(title: str, content: str) -> int (chat_id)
+    """
+    global _document_chat_handler
+    _document_chat_handler = handler
+
+
 INTERNAL_TOOL_DEFINITIONS = [
     {
         "name": "decompile_function",
@@ -125,6 +139,18 @@ INTERNAL_TOOL_DEFINITIONS = [
             }
         }
     },
+    {
+        "name": "add_document_to_chat",
+        "description": "Create a new chat document with custom markdown content. Use this to produce standalone analysis reports, summaries, or findings separate from the current conversation.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Title for the new chat document"},
+                "content": {"type": "string", "description": "Markdown content for the document"}
+            },
+            "required": ["title", "content"]
+        }
+    },
 ]
 
 
@@ -162,6 +188,7 @@ def execute_internal_tool(name: str, arguments: Dict[str, Any]) -> str:
         "rename_variable": _rename_variable,
         "get_function_list": _get_function_list,
         "get_strings": _get_strings,
+        "add_document_to_chat": _add_document_to_chat,
     }
     handler = handlers.get(name)
     if not handler:
@@ -411,3 +438,16 @@ def _get_strings(args: Dict) -> List['TextContent']:
     if result_holder[1]:
         return [TextContent(type="text", text=f"Error: {result_holder[1]}")]
     return result_holder[0]
+
+
+def _add_document_to_chat(args: Dict) -> List['TextContent']:
+    """Create a new chat document with custom markdown content."""
+    if _document_chat_handler is None:
+        return [TextContent(type="text", text="Error: document chat handler not registered")]
+    title = args.get("title", "Untitled Document")
+    content = args.get("content", "")
+    try:
+        chat_id = _document_chat_handler(title, content)
+        return [TextContent(type="text", text=f"Document '{title}' created as Chat {chat_id}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"Error creating document: {e}")]

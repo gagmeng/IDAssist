@@ -7,6 +7,7 @@ execution, and result aggregation across multiple MCP servers.
 """
 
 import asyncio
+import json
 import time
 import threading
 from typing import List, Dict, Any, Optional, Tuple
@@ -217,9 +218,20 @@ class MCPToolOrchestrator:
                     binary_hash, AnalysisDBService()
                 )
                 execution_time = time.time() - start_time
+
+                # Detect error dicts returned as content (e.g. {"error": "Function not found..."})
+                error_msg = None
+                try:
+                    parsed = json.loads(result_text)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        error_msg = parsed["error"]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     content=result_text,
+                    error=error_msg,
                     execution_time=execution_time,
                     server_name="__graphrag__"
                 )
@@ -231,6 +243,11 @@ class MCPToolOrchestrator:
                 log.log_info(f"Executing internal tool: {tool_call.name}")
                 result_text = execute_internal_tool(tool_call.name, tool_call.arguments)
                 execution_time = time.time() - start_time
+
+                # Post-rename hook: sync function name to knowledge graph
+                if tool_call.name == "rename_function" and "Renamed " in result_text:
+                    self._sync_rename_to_graph(tool_call.arguments)
+
                 return ToolResult(
                     tool_call_id=tool_call.id,
                     content=result_text,
@@ -251,6 +268,11 @@ class MCPToolOrchestrator:
                     log.log_info(f"Falling back to internal tool: {tool_call.name}")
                     result_text = execute_internal_tool(tool_call.name, tool_call.arguments)
                     execution_time = time.time() - start_time
+
+                    # Post-rename hook: sync function name to knowledge graph
+                    if tool_call.name == "rename_function" and "Renamed " in result_text:
+                        self._sync_rename_to_graph(tool_call.arguments)
+
                     return ToolResult(
                         tool_call_id=tool_call.id,
                         content=result_text,
@@ -369,6 +391,43 @@ class MCPToolOrchestrator:
             'get_data_at_address', 'analyze_address'
         }
         return tool_name in address_tools
+
+    def _sync_rename_to_graph(self, arguments: Dict[str, Any]) -> None:
+        """Sync a function rename to the knowledge graph (best-effort)."""
+        try:
+            address_str = arguments.get("address")
+            new_name = arguments.get("new_name")
+            if not address_str or not new_name:
+                return
+
+            address = int(str(address_str).strip(), 16)
+
+            # Get binary hash (same pattern as graphrag tool routing)
+            binary_hash = None
+            if self.binary_context_service:
+                binary_hash = self.binary_context_service.get_binary_hash()
+            if not binary_hash:
+                from src.ida_compat import get_binary_hash, execute_on_main_thread
+                result_holder = [None]
+                def _do():
+                    result_holder[0] = get_binary_hash()
+                execute_on_main_thread(_do)
+                binary_hash = result_holder[0]
+
+            if not binary_hash:
+                return
+
+            from .analysis_db_service import AnalysisDBService
+            from .graphrag.graph_store import GraphStore
+            graph_store = GraphStore(AnalysisDBService())
+            updated = graph_store.update_node_name(binary_hash, address, new_name)
+
+            if updated:
+                log.log_info(f"Synced rename to graph: {new_name} at {hex(address)}")
+            else:
+                log.log_debug(f"No graph node at {hex(address)} (not yet indexed)")
+        except Exception as e:
+            log.log_warn(f"Failed to sync rename to graph (non-fatal): {e}")
 
     def format_tool_results_for_llm(self, tool_calls: List[ToolCall], results: List[ToolResult]) -> List[Dict[str, Any]]:
         """

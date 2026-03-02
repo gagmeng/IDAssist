@@ -105,9 +105,9 @@ class IDAssistForm(idaapi.PluginForm):
             self._init_query_tab()
             self._init_actions_tab()
             self._init_semantic_graph_tab()
-            self._init_rag_tab()
             if self._is_symgraph_enabled():
                 self._init_symgraph_tab()
+            self._init_rag_tab()
             self._init_settings_tab()
 
             layout.addWidget(self.tabs)

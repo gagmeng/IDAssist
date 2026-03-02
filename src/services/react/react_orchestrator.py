@@ -56,6 +56,7 @@ class ReActOrchestrator:
         self.cancelled = False
         self.iteration_count = 0
         self.tool_call_count = 0
+        self.tool_fail_counts: Dict[str, int] = {}  # tool_name -> consecutive failure count
         self.start_time = 0.0
 
         # Conversation history (maintained across iterations for context continuity)
@@ -127,6 +128,7 @@ class ReActOrchestrator:
         self.start_time = time.time()
         self.iteration_count = 0
         self.tool_call_count = 0
+        self.tool_fail_counts.clear()
         self.cancelled = False
         self.findings.clear()
         self.todo_manager.clear()
@@ -341,6 +343,20 @@ class ReActOrchestrator:
                     content = f"Error: No result returned for tool call"
                 else:
                     content = result.content if not result.error else f"Error: {result.error}"
+
+                # Track per-tool failure counts and add escalating hints
+                if result and result.error:
+                    self.tool_fail_counts[tc.name] = self.tool_fail_counts.get(tc.name, 0) + 1
+                    fail_count = self.tool_fail_counts[tc.name]
+                    if fail_count >= 3:
+                        content += (f"\n\nWARNING: '{tc.name}' has failed {fail_count} consecutive times. "
+                                    f"This tool is not working for your current use case. "
+                                    f"Do NOT call it again — use a different approach or skip this step.")
+                    elif fail_count >= 2:
+                        content += (f"\n\nNote: '{tc.name}' has now failed {fail_count} times in a row. "
+                                    f"Consider using a different tool or approach.")
+                elif result and not result.error:
+                    self.tool_fail_counts[tc.name] = 0
 
                 # Truncate oversized tool results to prevent context overflow
                 content = self.context_manager.truncate_tool_result(content)

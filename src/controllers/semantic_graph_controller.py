@@ -143,7 +143,7 @@ class SemanticGraphController:
             return
         # For IDA, we pass the function object (ida_funcs.func_t) or address
         # The graph_service.index_function needs to handle IDA function objects
-        self.graph_service.index_function(None, function, self.binary_hash)
+        self.graph_service.index_function(function, self.binary_hash)
         self.refresh_current_view()
 
     def handle_reindex(self):
@@ -160,7 +160,6 @@ class SemanticGraphController:
         self._reindex_worker = ReindexWorker(
             self.graph_service,
             self.graph_store,
-            None,  # No binary_view in IDA
             self.binary_hash,
         )
         self._reindex_worker.progress.connect(self._on_reindex_progress)
@@ -203,7 +202,6 @@ class SemanticGraphController:
             provider_config,
             self.llm_factory,
             self.graph_service,
-            None,  # No binary_view in IDA
             self.binary_hash,
             settings_service=self.settings_service,
             rag_enabled=rag_enabled,
@@ -788,14 +786,13 @@ class SemanticAnalysisWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, provider_config, llm_factory, graph_service,
-                 binary_view, binary_hash: str, limit: int = 0,
+                 binary_hash: str, limit: int = 0,
                  settings_service=None, rag_enabled: bool = False,
                  mcp_enabled: bool = False, force: bool = False):
         super().__init__()
         self.provider_config = provider_config
         self.llm_factory = llm_factory
         self.graph_service = graph_service
-        self.binary_view = binary_view
         self.binary_hash = binary_hash
         self.limit = limit
         self.settings_service = settings_service
@@ -831,7 +828,6 @@ class SemanticAnalysisWorker(QThread):
         self._extractor = SemanticExtractor(
             provider,
             self.graph_service.store,
-            None,  # No binary_view in IDA
             self.binary_hash,
             summary_service=summary_service,
             rag_enabled=self.rag_enabled,
@@ -890,11 +886,10 @@ class ReindexWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, graph_service: GraphRAGService, graph_store: GraphStore,
-                 binary_view, binary_hash: str):
+                 binary_hash: str):
         super().__init__()
         self.graph_service = graph_service
         self.graph_store = graph_store
-        self.binary_view = binary_view
         self.binary_hash = binary_hash
         self._cancelled = False
         self._extractor = None

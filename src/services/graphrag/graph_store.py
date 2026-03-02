@@ -238,6 +238,31 @@ class GraphStore:
             finally:
                 conn.close()
 
+    def update_node_name(self, binary_hash: str, address: int, new_name: str) -> bool:
+        """Update just the name of a function node by address (lightweight).
+
+        Only touches name and updated_at — preserves all other fields.
+        The existing graph_nodes_au AFTER UPDATE trigger automatically updates FTS.
+
+        Returns True if a row was updated, False if node not indexed yet.
+        """
+        if not binary_hash or address is None:
+            return False
+        now_ms = self._now_ms()
+        with self._db_lock:
+            conn = self.analysis_db.get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE graph_nodes
+                    SET name = ?, updated_at = ?
+                    WHERE binary_id = ? AND type = 'FUNCTION' AND address = ?
+                ''', (new_name, now_ms, binary_hash, address))
+                conn.commit()
+                return cursor.rowcount > 0
+            finally:
+                conn.close()
+
     def add_edge(self, edge: GraphEdge) -> GraphEdge:
         if not edge.binary_hash:
             raise ValueError("binary_hash is required for GraphEdge insert")

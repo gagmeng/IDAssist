@@ -263,23 +263,33 @@ class QueryTabView(QWidget):
 
         self.is_edit_mode = not self.is_edit_mode
 
+        # Save history and input panel sizes before the swap
+        old_sizes = self.splitter.sizes()
+        history_size = old_sizes[2] if len(old_sizes) >= 3 else 80
+        input_size = old_sizes[3] if len(old_sizes) >= 4 else 100
+
         if self.is_edit_mode:
-            # Switch to edit mode
             self.query_browser.hide()
             self.query_editor.show()
             self.edit_save_button.setText("Save")
             # Don't set content here - let the controller prepare proper editable content
             # via set_chat_content() after receiving edit_mode_changed signal
         else:
-            # Switch to read mode (save)
             self.query_editor.hide()
             self.query_browser.show()
             self.edit_save_button.setText("Edit")
             # Store edited content for the controller to save
             self.markdown_content = self.query_editor.toPlainText()
             self.query_browser.setHtml(self.markdown_to_html(self.markdown_content))
-            # Also update the markdown source for copy operations
             self.query_browser.set_markdown_source(self.markdown_content)
+
+        # Restore: give all remaining space to the active text widget
+        total = sum(self.splitter.sizes())
+        active_size = total - history_size - input_size
+        if self.is_edit_mode:
+            self.splitter.setSizes([0, active_size, history_size, input_size])
+        else:
+            self.splitter.setSizes([active_size, 0, history_size, input_size])
 
         self.edit_mode_changed.emit(self.is_edit_mode)
 

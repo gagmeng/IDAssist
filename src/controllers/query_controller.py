@@ -15,6 +15,7 @@ from src.services.models.mcp_models import MCPToolExecutionRequest
 from src.services.mcp_connection_manager import MCPConnectionManager
 from src.services.mcp_tool_orchestrator import MCPToolOrchestrator
 from src.services.models.llm_models import ToolCall, ToolResult
+from src.services.internal_tools import set_document_chat_handler
 from src.services.rlhf_service import rlhf_service
 from src.services.models.rlhf_models import RLHFFeedbackEntry
 from src.controllers.chat_edit_manager import ChatEditManager
@@ -536,6 +537,9 @@ class QueryController:
         # Connect view signals
         self._connect_signals()
 
+        # Register document chat handler for internal tools
+        set_document_chat_handler(self._create_document_chat)
+
     def initialize_binary(self):
         """Initialize binary context for IDA (called after binary is loaded)"""
         from src.ida_compat import get_binary_hash
@@ -1003,7 +1007,53 @@ class QueryController:
         self.view.set_chat_content(initial_content)
         
         log.log_info(f"New chat created: {chat_name}")
-    
+
+    def _create_document_chat(self, title: str, content: str) -> int:
+        """Create a new chat populated with document content (called from tool thread).
+
+        This is invoked by the add_document_to_chat internal tool. The chat
+        appears in the sidebar without disrupting the current conversation.
+        """
+        chat_id = self.next_chat_id
+        self.next_chat_id += 1
+
+        timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd hh:mm:ss")
+
+        # Create chat data with a single assistant message
+        self.chats[chat_id] = {
+            "name": title,
+            "messages": [{
+                "role": "assistant",
+                "content": content,
+                "timestamp": timestamp
+            }],
+            "created": timestamp,
+            "updated": timestamp
+        }
+
+        # Persist to database
+        binary_hash = self._current_query_binary_hash or self._get_current_binary_hash()
+        if binary_hash:
+            try:
+                self.analysis_db.save_chat_metadata(binary_hash, str(chat_id), title)
+                self.analysis_db.save_chat_message(
+                    binary_hash, str(chat_id), "assistant", content,
+                    metadata={"message_order": 0}
+                )
+            except Exception as e:
+                log.log_error(f"Failed to persist document chat: {e}")
+
+        # Update UI on the main thread (this may be called from a worker thread)
+        from src.ida_compat import execute_on_main_thread
+
+        def _ui_update():
+            self.view.add_chat_to_history(chat_id, title, timestamp)
+
+        execute_on_main_thread(_ui_update)
+
+        log.log_info(f"Document chat created: '{title}' (Chat {chat_id})")
+        return chat_id
+
     def delete_chats(self, selected_rows: List[int]):
         """Delete selected chats"""
         if not selected_rows:

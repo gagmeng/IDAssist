@@ -43,11 +43,11 @@ class GraphRAGService:
     def search_nodes(self, binary_hash: str, query: str, limit: int = 10):
         return self.store.search_nodes(binary_hash, query, limit)
 
-    def index_function(self, binary_view, function, binary_hash: str) -> Optional[GraphNode]:
-        extractor = StructureExtractor(binary_view, self.store)
+    def index_function(self, function, binary_hash: str) -> Optional[GraphNode]:
+        extractor = StructureExtractor(self.store)
         return extractor.extract_function(function, binary_hash)
 
-    async def summarize_stale_nodes(self, binary_view, binary_hash: str, provider,
+    async def summarize_stale_nodes(self, binary_hash: str, provider,
                                     limit: int = 0, progress_callback=None) -> ExtractionResult:
-        extractor = SemanticExtractor(provider, self.store, binary_view, binary_hash)
+        extractor = SemanticExtractor(provider, self.store, binary_hash)
         return await extractor.summarize_stale_nodes(limit, progress_callback)

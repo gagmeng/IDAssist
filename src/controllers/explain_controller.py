@@ -313,7 +313,7 @@ class ExplainController:
                 func = ida_funcs.get_func(function_start)
                 if func and binary_hash:
                     node = self.graphrag_service.index_function(
-                        None, func, binary_hash
+                        func, binary_hash
                     )
                     if node:
                         self._update_security_panel_from_node(node)
@@ -542,7 +542,7 @@ class ExplainController:
                         func = ida_funcs.get_func(analysis_address)
                         if func:
                             node = self.graphrag_service.index_function(
-                                None, func, binary_hash
+                                func, binary_hash
                             )
                     except Exception:
                         pass
@@ -911,7 +911,7 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
                                 func = ida_funcs.get_func(function_start)
                                 if func:
                                     node = self.graphrag_service.index_function(
-                                        None, func, binary_hash
+                                        func, binary_hash
                                     )
                             except Exception:
                                 pass

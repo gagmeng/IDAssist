@@ -28,18 +28,17 @@ class SemanticExtractor:
     DEFAULT_BATCH_SIZE = 3
     DEFAULT_DELAY_MS = 500
 
-    def __init__(self, provider, graph_store: GraphStore, binary_view, binary_hash: str,
+    def __init__(self, provider, graph_store: GraphStore, binary_hash: str,
                  summary_service: Optional["FunctionSummaryService"] = None,
                  rag_enabled: bool = False, mcp_enabled: bool = False):
         self.provider = provider
         self.graph_store = graph_store
-        self.binary_view = binary_view
         self.binary_hash = binary_hash
         self.batch_size = self.DEFAULT_BATCH_SIZE
         self.delay_between_batches = self.DEFAULT_DELAY_MS / 1000.0
         self.cancelled = False
-        self._context_service = BinaryContextService(binary_view) if binary_view else None
-        self._security_extractor = SecurityFeatureExtractor(binary_view) if binary_view else None
+        self._context_service = BinaryContextService()
+        self._security_extractor = SecurityFeatureExtractor()
         self._summary_service = summary_service
         self.rag_enabled = rag_enabled
         self.mcp_enabled = mcp_enabled
@@ -144,7 +143,7 @@ class SemanticExtractor:
             try:
                 prompt = self._summary_service.generate_full_query(
                     node.address,
-                    view_level=ViewLevel.HLIL,  # Use HLIL - fast and reliable
+                    view_level=ViewLevel.PSEUDO_C,  # Use pseudocode (decompiler output)
                     rag_enabled=self.rag_enabled,
                     mcp_enabled=self.mcp_enabled
                 )
@@ -220,8 +219,8 @@ class SemanticExtractor:
     def _get_raw_code(self, address: Optional[int]) -> Optional[str]:
         if not address or not self._context_service:
             return None
-        # Use HLIL first - fast and reliable (no PSEUDO_C timeouts)
-        for level in (ViewLevel.HLIL, ViewLevel.MLIL, ViewLevel.LLIL, ViewLevel.ASM):
+        # Prefer pseudocode (decompiler), fall back to assembly
+        for level in (ViewLevel.PSEUDO_C, ViewLevel.ASM):
             result = self._context_service.get_code_at_level(address, level, context_lines=0)
             if result.get("error"):
                 continue
