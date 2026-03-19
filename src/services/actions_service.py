@@ -189,7 +189,7 @@ class ActionsService:
             execute_on_main_thread(_do_rename)
 
             if result_holder[0]:
-                # Sync rename to knowledge graph (best-effort)
+                # Sync rename to knowledge graph and record LLM provenance (best-effort)
                 try:
                     from .analysis_db_service import AnalysisDBService
                     from .graphrag.graph_store import GraphStore
@@ -199,10 +199,12 @@ class ActionsService:
                         bh_holder[0] = get_binary_hash()
                     execute_on_main_thread(_get_hash)
                     if bh_holder[0]:
-                        gs = GraphStore(AnalysisDBService())
+                        db = AnalysisDBService()
+                        gs = GraphStore(db)
                         gs.update_node_name(bh_holder[0], function_address, new_name)
+                        db.record_llm_rename(bh_holder[0], function_address, 'function', new_name)
                 except Exception as e:
-                    log.log_warn(f"Graph name sync failed (non-fatal): {e}")
+                    log.log_warn(f"Graph/provenance sync failed (non-fatal): {e}")
 
                 return ActionResult(
                     success=True,
@@ -262,6 +264,19 @@ class ActionsService:
             execute_on_main_thread(_do_rename)
 
             if result_holder[0]:
+                # Record LLM rename for provenance tracking (best-effort)
+                try:
+                    from .analysis_db_service import AnalysisDBService
+                    from src.ida_compat import get_binary_hash
+                    bh_holder = [None]
+                    def _get_hash():
+                        bh_holder[0] = get_binary_hash()
+                    execute_on_main_thread(_get_hash)
+                    if bh_holder[0]:
+                        AnalysisDBService().record_llm_rename(bh_holder[0], function_address, 'variable', new_name)
+                except Exception as e:
+                    log.log_warn(f"Provenance record failed (non-fatal): {e}")
+
                 return ActionResult(
                     success=True,
                     message=f"Renamed variable from '{var_name}' to '{new_name}'",
@@ -320,6 +335,19 @@ class ActionsService:
             execute_on_main_thread(_do_rename)
 
             if result_holder[0]:
+                # Record LLM rename for provenance tracking (best-effort)
+                try:
+                    from .analysis_db_service import AnalysisDBService
+                    from src.ida_compat import get_binary_hash
+                    bh_holder = [None]
+                    def _get_hash():
+                        bh_holder[0] = get_binary_hash()
+                    execute_on_main_thread(_get_hash)
+                    if bh_holder[0]:
+                        AnalysisDBService().record_llm_rename(bh_holder[0], function_address, 'variable', new_name)
+                except Exception as e:
+                    log.log_warn(f"Provenance record failed (non-fatal): {e}")
+
                 return ActionResult(
                     success=True,
                     message=f"Renamed stack variable '{var_name}' to '{new_name}'",

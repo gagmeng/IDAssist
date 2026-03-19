@@ -351,6 +351,18 @@ def _rename_function(args: Dict) -> List['TextContent']:
     if result_holder[2]:
         return [TextContent(type="text", text=f"Error: {result_holder[2]}")]
     if result_holder[0]:
+        # Record LLM rename for provenance tracking (best-effort)
+        try:
+            from .analysis_db_service import AnalysisDBService
+            from src.ida_compat import get_binary_hash
+            bh_holder = [None]
+            def _get_hash():
+                bh_holder[0] = get_binary_hash()
+            execute_on_main_thread(_get_hash)
+            if bh_holder[0]:
+                AnalysisDBService().record_llm_rename(bh_holder[0], ea, 'function', new_name)
+        except Exception:
+            pass
         return [TextContent(type="text", text=f"Renamed '{result_holder[1]}' to '{new_name}'")]
     else:
         return [TextContent(type="text", text=f"Failed to rename function to '{new_name}'")]

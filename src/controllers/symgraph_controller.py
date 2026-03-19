@@ -590,6 +590,21 @@ class SymGraphController(QObject):
         else:
             self.view.set_binary_info("<no binary loaded>", None)
 
+    def _get_symbol_provenance(self, is_auto: bool, address: int, symbol_type: str) -> str:
+        """Determine symbol provenance: decompiler, llm, or user."""
+        if is_auto:
+            return 'decompiler'
+        try:
+            from src.services.analysis_db_service import AnalysisDBService
+            binary_hash = self._get_sha256()
+            if binary_hash:
+                db = AnalysisDBService()
+                if db.is_llm_renamed(binary_hash, address, symbol_type):
+                    return 'llm'
+        except Exception:
+            pass
+        return 'user'
+
     def _get_sha256(self) -> Optional[str]:
         """Get SHA256 hash of the original binary."""
         return get_binary_hash() or None
@@ -1006,7 +1021,7 @@ class SymGraphController(QObject):
             'name': func_name,
             'data_type': data_type,
             'confidence': 0.5 if is_auto else 0.9,
-            'provenance': 'decompiler' if is_auto else 'user'
+            'provenance': self._get_symbol_provenance(is_auto, func.start_ea, 'function')
         }
 
     def _is_auto_generated_name(self, name: str) -> bool:
@@ -1221,7 +1236,7 @@ class SymGraphController(QObject):
             'raw_content': node.raw_code,
             'llm_summary': node.llm_summary,
             'confidence': confidence,
-            'provenance': 'user' if node.user_edited else 'decompiler',
+            'provenance': 'user' if node.user_edited else ('llm' if node.llm_summary else 'decompiler'),
         }
 
         if node.security_flags:
