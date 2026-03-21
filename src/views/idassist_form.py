@@ -284,7 +284,10 @@ class IDAssistForm(idaapi.PluginForm):
             from src.controllers.symgraph_controller import SymGraphController
 
             self.symgraph_view = SymGraphTabView()
-            self.symgraph_controller = SymGraphController(self.symgraph_view)
+            self.symgraph_controller = SymGraphController(
+                self.symgraph_view,
+                query_controller=getattr(self, 'query_controller', None),
+            )
             self.tabs.addTab(self.symgraph_view, "SymGraph")
         except Exception as e:
             log.log_error(f"Failed to init SymGraph tab: {e}")

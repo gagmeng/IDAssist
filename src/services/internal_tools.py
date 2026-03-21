@@ -140,7 +140,7 @@ INTERNAL_TOOL_DEFINITIONS = [
         }
     },
     {
-        "name": "add_document_to_chat",
+        "name": "ga_add_document",
         "description": "Create a new chat document with custom markdown content. Use this to produce standalone analysis reports, summaries, or findings separate from the current conversation.",
         "schema": {
             "type": "object",
@@ -188,7 +188,7 @@ def execute_internal_tool(name: str, arguments: Dict[str, Any]) -> str:
         "rename_variable": _rename_variable,
         "get_function_list": _get_function_list,
         "get_strings": _get_strings,
-        "add_document_to_chat": _add_document_to_chat,
+        "ga_add_document": _ga_add_document,
     }
     handler = handlers.get(name)
     if not handler:
@@ -452,7 +452,7 @@ def _get_strings(args: Dict) -> List['TextContent']:
     return result_holder[0]
 
 
-def _add_document_to_chat(args: Dict) -> List['TextContent']:
+def _ga_add_document(args: Dict) -> List['TextContent']:
     """Create a new chat document with custom markdown content."""
     if _document_chat_handler is None:
         return [TextContent(type="text", text="Error: document chat handler not registered")]
