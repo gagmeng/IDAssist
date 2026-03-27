@@ -13,6 +13,7 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
+from .function_signature_generator import IDAFunctionSignatureGenerator
 from .graph_store import GraphStore
 from .models import GraphNode, GraphEdge, EdgeType
 from .security_feature_extractor import SecurityFeatureExtractor
@@ -54,6 +55,7 @@ class StructureExtractor:
         self.graph_store = graph_store
         self.security_extractor = SecurityFeatureExtractor()
         self.context_service = BinaryContextService()
+        self.signature_generator = IDAFunctionSignatureGenerator()
         self._cancelled = False
         self._progress_lock = threading.Lock()
 
@@ -90,8 +92,10 @@ class StructureExtractor:
         else:
             node.name = func_name
 
-        raw_code = self._get_raw_code(func_ea)
-        features = self.security_extractor.extract_features_from_code(func_name, raw_code)
+        decompiled_code = self._get_decompiled_code(func_ea)
+        disassembly = self._get_disassembly(func_ea)
+        node.signature = self.signature_generator.generate(func_ea)
+        features = self.security_extractor.extract_features_from_code(func_name, decompiled_code or disassembly)
         node.network_apis = sorted(features.network_apis)
         node.file_io_apis = sorted(features.file_io_apis)
         node.ip_addresses = sorted(features.ip_addresses)
@@ -102,8 +106,10 @@ class StructureExtractor:
         node.activity_profile = features.get_activity_profile()
         node.risk_level = features.get_risk_level()
         node.security_flags = features.generate_security_flags()
-        if raw_code:
-            node.raw_code = raw_code
+        if decompiled_code:
+            node.set_decompiled_code(decompiled_code)
+        if disassembly:
+            node.disassembly = disassembly
         node.is_stale = True
 
         node = self.graph_store.upsert_node(node)
@@ -289,6 +295,9 @@ class StructureExtractor:
                     node_type="FUNCTION",
                     address=func_ea,
                     name=func_name,
+                    signature=None,
+                    decompiled_code=None,
+                    disassembly=None,
                     raw_code=None,
                     is_stale=True,
                 )
@@ -378,13 +387,19 @@ class StructureExtractor:
                 if not func_exists:
                     continue
 
-                # _get_raw_code already uses execute_on_main_thread internally
-                raw_code = self._get_raw_code(node.address)
-                if raw_code:
-                    node.raw_code = raw_code
+                decompiled_code = self._get_decompiled_code(node.address)
+                disassembly = self._get_disassembly(node.address)
+                if decompiled_code:
+                    node.set_decompiled_code(decompiled_code)
+                if disassembly:
+                    node.disassembly = disassembly
+                node.signature = self.signature_generator.generate(node.address)
 
                 func_name = func_name_result
-                features = self.security_extractor.extract_features_from_code(func_name, raw_code)
+                features = self.security_extractor.extract_features_from_code(
+                    func_name,
+                    decompiled_code or disassembly,
+                )
                 node.network_apis = sorted(features.network_apis)
                 node.file_io_apis = sorted(features.file_io_apis)
                 node.ip_addresses = sorted(features.ip_addresses)
@@ -474,37 +489,43 @@ class StructureExtractor:
 
         return result
 
-    def _get_raw_code(self, address: int) -> Optional[str]:
-        """Get decompiled or disassembled code for a function.
-
-        All IDA API calls are marshalled to the main thread.
-        """
+    def _get_decompiled_code(self, address: int) -> Optional[str]:
+        """Get decompiled code for a function."""
         if not address:
             return None
 
         result = [None]
 
         def _do():
-            # Try Hex-Rays decompilation first
             try:
                 cfunc = ida_hexrays.decompile(address)
                 if cfunc:
                     result[0] = str(cfunc)
-                    return
             except Exception:
                 pass
 
-            # Fall back to assembly
+        execute_on_main_thread(_do)
+        return result[0]
+
+    def _get_disassembly(self, address: int) -> Optional[str]:
+        """Get function disassembly."""
+        if not address:
+            return None
+
+        result = [None]
+
+        def _do():
             try:
                 func = ida_funcs.get_func(address)
-                if func:
-                    lines = []
-                    for item_ea in idautils.FuncItems(func.start_ea):
-                        disasm = idc.generate_disasm_line(item_ea, 0)
-                        if disasm:
-                            lines.append(f"0x{item_ea:08x}  {disasm}")
-                    if lines:
-                        result[0] = "\n".join(lines)
+                if not func:
+                    return
+                lines = []
+                for item_ea in idautils.FuncItems(func.start_ea):
+                    disasm = idc.generate_disasm_line(item_ea, 0)
+                    if disasm:
+                        lines.append(f"0x{item_ea:08x}  {disasm}")
+                if lines:
+                    result[0] = "\n".join(lines)
             except Exception:
                 pass
 

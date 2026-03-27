@@ -554,6 +554,8 @@ class ApplySymbolsWorker(QThread):
             graph_store.delete_communities(self.binary_hash)
 
         address_to_id: Dict[int, str] = {}
+        endpoint_to_id: Dict[tuple, str] = {}
+        name_to_id: Dict[str, str] = {}
         for i, node in enumerate(self.graph_export.nodes):
             if self._cancelled:
                 return progress_count
@@ -564,6 +566,9 @@ class ApplySymbolsWorker(QThread):
 
             if merge_policy == "prefer_local" and existing:
                 address_to_id[node.address] = existing.id
+                endpoint_to_id[self._graph_endpoint_key(node.address, node.name)] = existing.id
+                if node.name:
+                    name_to_id[node.name] = existing.id
             else:
                 props = node.properties or {}
                 node_id = existing.id if existing else node.id
@@ -574,7 +579,10 @@ class ApplySymbolsWorker(QThread):
                     node_type=node_type,
                     address=node.address,
                     name=node.name,
-                    raw_code=props.get("raw_code") or props.get("raw_content"),
+                    signature=props.get("signature"),
+                    decompiled_code=props.get("decompiled_code") or props.get("raw_code") or props.get("raw_content"),
+                    disassembly=props.get("disassembly"),
+                    raw_code=props.get("decompiled_code") or props.get("raw_code") or props.get("raw_content"),
                     llm_summary=node.summary or props.get("llm_summary"),
                     confidence=float(props.get("confidence", 0.0) or 0.0),
                     security_flags=self._coerce_list(props.get("security_flags")),
@@ -593,6 +601,9 @@ class ApplySymbolsWorker(QThread):
                 )
                 graph_store.upsert_node(local_node)
                 address_to_id[node.address] = local_node.id
+                endpoint_to_id[self._graph_endpoint_key(node.address, node.name)] = local_node.id
+                if node.name:
+                    name_to_id[node.name] = local_node.id
 
             progress_count += 1
             self.progress.emit(progress_count, total,
@@ -602,8 +613,17 @@ class ApplySymbolsWorker(QThread):
             if self._cancelled:
                 return progress_count
 
-            source_id = address_to_id.get(edge.source_address)
-            target_id = address_to_id.get(edge.target_address)
+            source_id = endpoint_to_id.get(self._graph_endpoint_key(edge.source_address, edge.source_name))
+            if not source_id:
+                source_id = address_to_id.get(edge.source_address)
+            if not source_id and edge.source_address == 0 and edge.source_name:
+                source_id = name_to_id.get(edge.source_name)
+
+            target_id = endpoint_to_id.get(self._graph_endpoint_key(edge.target_address, edge.target_name))
+            if not target_id:
+                target_id = address_to_id.get(edge.target_address)
+            if not target_id and edge.target_address == 0 and edge.target_name:
+                target_id = name_to_id.get(edge.target_name)
             if not source_id or not target_id:
                 progress_count += 1
                 self.progress.emit(progress_count, total,
@@ -633,6 +653,10 @@ class ApplySymbolsWorker(QThread):
     @staticmethod
     def _coerce_list(value):
         return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _graph_endpoint_key(address: Optional[int], name: Optional[str]) -> tuple:
+        return (int(address or 0), name or None)
 
 
 class SymGraphController(QObject):
@@ -1509,6 +1533,10 @@ class SymGraphController(QObject):
                 if func:
                     local_node = graph_store.get_node_by_address(
                         binary_hash, "FUNCTION", func.start_ea
+                    ) or graph_store.get_node_by_address(
+                        binary_hash, "THUNK", func.start_ea
+                    ) or graph_store.get_node_by_address(
+                        binary_hash, "EXTERNAL", func.start_ea
                     )
                     if local_node:
                         nodes.append(self._local_node_to_push_dict(local_node))
@@ -1521,16 +1549,15 @@ class SymGraphController(QObject):
                         nodes.append(self._ida_function_to_node_dict(func))
             else:
                 # Full binary scope
-                local_nodes = graph_store.get_nodes_by_type(binary_hash, "FUNCTION")
-                local_externals = graph_store.get_nodes_by_type(binary_hash, "EXTERNAL")
-                if local_externals:
-                    local_nodes = (local_nodes or []) + local_externals
+                local_nodes = graph_store.get_nodes_by_type(binary_hash, "FUNCTION") or []
+                local_nodes += graph_store.get_nodes_by_type(binary_hash, "EXTERNAL") or []
+                local_nodes += graph_store.get_nodes_by_type(binary_hash, "THUNK") or []
 
                 if local_nodes:
-                    node_id_to_address = {}
+                    node_id_to_node = {}
                     for local_node in local_nodes:
                         nodes.append(self._local_node_to_push_dict(local_node))
-                        node_id_to_address[local_node.id] = local_node.address
+                        node_id_to_node[local_node.id] = local_node
 
                     all_edges = graph_store.get_edges_by_types(
                         binary_hash,
@@ -1538,7 +1565,7 @@ class SymGraphController(QObject):
                          "taint_flows_to", "similar_purpose", "references"]
                     )
                     for edge in all_edges:
-                        edge_dict = self._local_edge_to_push_dict(edge, graph_store, node_id_to_address)
+                        edge_dict = self._local_edge_to_push_dict(edge, graph_store, node_id_to_node)
                         if edge_dict:
                             edges.append(edge_dict)
                 else:
@@ -1588,13 +1615,19 @@ class SymGraphController(QObject):
     def _ida_function_to_node_dict(self, func) -> Dict[str, Any]:
         """Convert an IDA function to a minimal graph node dictionary."""
         func_name = ida_funcs.get_func_name(func.start_ea)
-        # Classify external/thunk functions
         flags = func.flags
-        is_external = bool(flags & (ida_funcs.FUNC_LIB | ida_funcs.FUNC_THUNK))
+        node_type = 'function'
+        if flags & ida_funcs.FUNC_THUNK:
+            node_type = 'thunk'
+        elif flags & ida_funcs.FUNC_LIB:
+            node_type = 'external'
         return {
             'address': f"0x{func.start_ea:x}",
-            'node_type': 'external' if is_external else 'function',
+            'node_type': node_type,
             'name': func_name,
+            'signature': None,
+            'decompiled_code': None,
+            'disassembly': None,
             'raw_content': None,
             'llm_summary': None,
             'confidence': 0.0,
@@ -1614,7 +1647,10 @@ class SymGraphController(QObject):
             'address': f"0x{node.address:x}" if node.address else "0x0",
             'node_type': node.get_node_type_str().lower(),
             'name': node.name,
-            'raw_content': node.raw_code,
+            'signature': node.signature,
+            'decompiled_code': node.get_decompiled_code(),
+            'disassembly': node.disassembly,
+            'raw_content': node.get_decompiled_code(),
             'llm_summary': node.llm_summary,
             'confidence': confidence,
             'provenance': 'user' if node.user_edited else ('llm' if node.llm_summary else 'decompiler'),
@@ -1653,29 +1689,27 @@ class SymGraphController(QObject):
         self,
         edge: LocalGraphEdge,
         graph_store: GraphStore,
-        node_id_to_address: Optional[Dict[str, int]] = None
+        node_id_to_node: Optional[Dict[str, LocalGraphNode]] = None
     ) -> Optional[Dict[str, Any]]:
         """Convert a local GraphEdge to push format with weight."""
-        source_addr = None
-        target_addr = None
+        source_node: Optional[LocalGraphNode] = None
+        target_node: Optional[LocalGraphNode] = None
 
-        if node_id_to_address:
-            source_addr = node_id_to_address.get(edge.source_id)
-            target_addr = node_id_to_address.get(edge.target_id)
+        if node_id_to_node:
+            source_node = node_id_to_node.get(edge.source_id)
+            target_node = node_id_to_node.get(edge.target_id)
         else:
             source_node = graph_store.get_node_by_id(edge.source_id)
             target_node = graph_store.get_node_by_id(edge.target_id)
-            if source_node:
-                source_addr = source_node.address
-            if target_node:
-                target_addr = target_node.address
 
-        if source_addr is None or target_addr is None:
+        if not source_node or not target_node:
             return None
 
         return {
-            'source_address': f"0x{source_addr:x}",
-            'target_address': f"0x{target_addr:x}",
+            'source_address': f"0x{(source_node.address or 0):x}",
+            'target_address': f"0x{(target_node.address or 0):x}",
+            'source_name': source_node.name,
+            'target_name': target_node.name,
             'edge_type': edge.get_edge_type_str(),
             'weight': edge.weight or 1.0
         }
