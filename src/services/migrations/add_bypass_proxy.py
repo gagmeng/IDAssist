@@ -12,7 +12,7 @@ from src.ida_compat import log
 def migrate_add_bypass_proxy(db_path: str):
     """
     Add bypass_proxy field to llm_providers table.
-    Default is True (bypass system proxy) to avoid 502 errors with local/intranet endpoints.
+    Default is False so providers use the system proxy unless explicitly told not to.
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -24,7 +24,7 @@ def migrate_add_bypass_proxy(db_path: str):
         if 'bypass_proxy' not in columns:
             cursor.execute('''
                 ALTER TABLE llm_providers
-                ADD COLUMN bypass_proxy BOOLEAN DEFAULT 1
+                ADD COLUMN bypass_proxy BOOLEAN DEFAULT 0
             ''')
             conn.commit()
             log.log_info("Added bypass_proxy column to llm_providers")

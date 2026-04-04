@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional, Union
 from src.ida_compat import log, get_user_data_dir
 
 
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 90
+
+
 class SettingsService:
     """
     Thread-safe settings service for IDAssist plugin.
@@ -91,6 +94,12 @@ class SettingsService:
                         api_key TEXT,
                         disable_tls BOOLEAN DEFAULT 0,
                         provider_type TEXT DEFAULT 'openai_platform',
+                        reasoning_effort TEXT DEFAULT 'none',
+                        model_family TEXT DEFAULT 'unknown',
+                        is_bedrock BOOLEAN DEFAULT 0,
+                        litellm_params TEXT DEFAULT '{}',
+                        timeout INTEGER DEFAULT 90,
+                        bypass_proxy BOOLEAN DEFAULT 0,
                         is_active BOOLEAN DEFAULT 0,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -130,6 +139,7 @@ class SettingsService:
                 migrate_add_provider_type,
                 migrate_add_reasoning_effort,
                 migrate_add_litellm_configs,
+                migrate_add_provider_timeout,
                 migrate_provider_type_names
             )
             from .migrations.add_oauth_credentials import migrate_add_oauth_credentials
@@ -137,6 +147,7 @@ class SettingsService:
             migrate_add_provider_type(self._db_path)
             migrate_add_reasoning_effort(self._db_path)
             migrate_add_litellm_configs(self._db_path)
+            migrate_add_provider_timeout(self._db_path)
             migrate_add_oauth_credentials(self._db_path)
             migrate_provider_type_names(self._db_path)
             migrate_add_bypass_proxy(self._db_path)
@@ -339,7 +350,8 @@ class SettingsService:
 
     def add_llm_provider(self, name: str, model: str, url: str, max_tokens: int = 4096,
                         api_key: str = '', disable_tls: bool = False, provider_type: str = 'openai_platform',
-                        reasoning_effort: str = 'none', bypass_proxy: bool = True) -> int:
+                        reasoning_effort: str = 'none', bypass_proxy: bool = False,
+                        timeout: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS) -> int:
         """Add a new LLM provider"""
         model_family = 'unknown'
         is_bedrock = False
@@ -353,9 +365,9 @@ class SettingsService:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO llm_providers
-                    (name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, model_family, is_bedrock, litellm_params, bypass_proxy)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, model_family, is_bedrock, '{}', bypass_proxy))
+                    (name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, model_family, is_bedrock, litellm_params, timeout, bypass_proxy)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, model_family, is_bedrock, '{}', timeout, bypass_proxy))
 
                 provider_id = cursor.lastrowid
                 conn.commit()
@@ -376,7 +388,7 @@ class SettingsService:
             try:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, is_active, reasoning_effort, bypass_proxy
+                    SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, is_active, reasoning_effort, timeout, bypass_proxy
                     FROM llm_providers ORDER BY name
                 ''')
 
@@ -393,7 +405,8 @@ class SettingsService:
                         'provider_type': row[7],
                         'is_active': bool(row[8]),
                         'reasoning_effort': row[9] if len(row) > 9 else 'none',
-                        'bypass_proxy': bool(row[10]) if len(row) > 10 else True
+                        'timeout': row[10] if len(row) > 10 else DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+                        'bypass_proxy': bool(row[11]) if len(row) > 11 else False
                     })
 
                 return providers
@@ -406,7 +419,7 @@ class SettingsService:
     def update_llm_provider(self, provider_id: int, **kwargs) -> bool:
         """Update an LLM provider"""
         valid_fields = {'name', 'model', 'url', 'max_tokens', 'api_key', 'disable_tls', 'bypass_proxy',
-                        'provider_type', 'is_active', 'reasoning_effort',
+                        'provider_type', 'is_active', 'reasoning_effort', 'timeout',
                         'model_family', 'is_bedrock', 'litellm_params'}
         update_fields = {k: v for k, v in kwargs.items() if k in valid_fields}
 
@@ -508,7 +521,7 @@ class SettingsService:
                 cursor = conn.cursor()
 
                 cursor.execute('''
-                    SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort
+                    SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, timeout, bypass_proxy
                     FROM llm_providers WHERE is_active = 1 LIMIT 1
                 ''')
 
@@ -524,7 +537,9 @@ class SettingsService:
                         'api_key': row[5],
                         'disable_tls': bool(row[6]),
                         'provider_type': row[7],
-                        'reasoning_effort': row[8] if len(row) > 8 else 'none'
+                        'reasoning_effort': row[8] if len(row) > 8 else 'none',
+                        'timeout': row[9] if len(row) > 9 else DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+                        'bypass_proxy': bool(row[10]) if len(row) > 10 else False
                     }
 
                 log.log_debug("No active provider in database, checking saved setting")
@@ -539,7 +554,7 @@ class SettingsService:
                     log.log_debug(f"Found saved active provider setting: {saved_provider_name}")
 
                     cursor.execute('''
-                        SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort
+                        SELECT id, name, model, url, max_tokens, api_key, disable_tls, provider_type, reasoning_effort, timeout, bypass_proxy
                         FROM llm_providers WHERE name = ? LIMIT 1
                     ''', (saved_provider_name,))
 
@@ -558,7 +573,9 @@ class SettingsService:
                             'api_key': provider_row[5],
                             'disable_tls': bool(provider_row[6]),
                             'provider_type': provider_row[7],
-                            'reasoning_effort': provider_row[8] if len(provider_row) > 8 else 'none'
+                            'reasoning_effort': provider_row[8] if len(provider_row) > 8 else 'none',
+                            'timeout': provider_row[9] if len(provider_row) > 9 else DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+                            'bypass_proxy': bool(provider_row[10]) if len(provider_row) > 10 else False
                         }
                     else:
                         log.log_warn(f"Saved provider '{saved_provider_name}' no longer exists in database")

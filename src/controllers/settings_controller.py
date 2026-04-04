@@ -11,13 +11,94 @@ from ..services.settings_service import settings_service
 from ..services.models.provider_types import ProviderType
 from ..services.mcp_client_service import MCPClientService
 from ..services.models.mcp_models import MCPServerConfig, MCPTestResult
+from ..services.llm_providers.base_provider import DEFAULT_PROVIDER_TIMEOUT_SECONDS
 from ..services import (
-    get_service_registry, LLMService, ChatMessage, MessageRole,
+    get_service_registry,
     LLMProviderError, APIProviderError, AuthenticationError,
     RateLimitError, NetworkError
 )
 from ..services.symgraph_service import symgraph_service, SymGraphAuthError, SymGraphNetworkError, SymGraphAPIError
 from ..views.settings_tab_view import SettingsTabView
+
+PROVIDER_WORKER_TIMEOUT_BUFFER_SECONDS = 5.0
+
+
+def validate_provider_test_config(provider_config):
+    """Validate a provider config before attempting a connectivity test."""
+    provider_name = provider_config.get('name', 'Provider') or 'Provider'
+    provider_type_value = provider_config.get('provider_type', 'openai_platform')
+
+    try:
+        provider_type = ProviderType(provider_type_value)
+    except ValueError:
+        return f"Provider '{provider_name}' has an invalid provider type: {provider_type_value}"
+
+    if not provider_config.get('model', '').strip():
+        return f"Provider '{provider_name}' has no model configured."
+
+    if (provider_type != ProviderType.ANTHROPIC_CLI and
+            not ProviderType.uses_oauth(provider_type) and
+            not provider_config.get('url', '').strip()):
+        return f"Provider '{provider_name}' has no URL configured."
+
+    if ProviderType.requires_api_key(provider_type) and not provider_config.get('api_key', '').strip():
+        return f"Provider '{provider_name}' has no API key configured."
+
+    if ProviderType.uses_oauth(provider_type) and not provider_config.get('api_key', '').strip():
+        return f"Provider '{provider_name}' is not authenticated. Click Authenticate first."
+
+    return None
+
+
+def get_provider_timeout_seconds(provider_config):
+    """Get the configured provider timeout as a positive float."""
+    try:
+        timeout = float(provider_config.get('timeout', DEFAULT_PROVIDER_TIMEOUT_SECONDS))
+        if timeout > 0:
+            return timeout
+    except (TypeError, ValueError):
+        pass
+    return float(DEFAULT_PROVIDER_TIMEOUT_SECONDS)
+
+
+def get_provider_worker_timeout_seconds(provider_config):
+    """Get the UI worker timeout derived from the provider timeout."""
+    return get_provider_timeout_seconds(provider_config) + PROVIDER_WORKER_TIMEOUT_BUFFER_SECONDS
+
+
+def supports_live_model_discovery(provider_type):
+    """Check whether a provider type supports live model discovery."""
+    return provider_type in {
+        ProviderType.OPENAI_PLATFORM,
+        ProviderType.XAI_PLATFORM,
+        ProviderType.LMSTUDIO,
+        ProviderType.OPENWEBUI,
+        ProviderType.GEMINI_PLATFORM,
+        ProviderType.LITELLM,
+        ProviderType.OLLAMA,
+    }
+
+
+def validate_provider_model_fetch_config(provider_config):
+    """Validate a provider config before attempting model discovery."""
+    provider_name = provider_config.get('name', 'Provider') or 'Provider'
+    provider_type_value = provider_config.get('provider_type', 'openai_platform')
+
+    try:
+        provider_type = ProviderType(provider_type_value)
+    except ValueError:
+        return f"Provider '{provider_name}' has an invalid provider type: {provider_type_value}"
+
+    if supports_live_model_discovery(provider_type) and not provider_config.get('url', '').strip():
+        return f"Provider '{provider_name}' has no URL configured."
+
+    if ProviderType.requires_api_key(provider_type) and not provider_config.get('api_key', '').strip():
+        return f"Provider '{provider_name}' has no API key configured."
+
+    if ProviderType.uses_oauth(provider_type) and not provider_config.get('api_key', '').strip():
+        return f"Provider '{provider_name}' is not authenticated. Click Authenticate first."
+
+    return None
 
 
 class ProviderTestWorker(QThread):
@@ -27,7 +108,9 @@ class ProviderTestWorker(QThread):
 
     def __init__(self, provider_config):
         super().__init__()
-        self.provider_config = provider_config
+        # Snapshot the current dialog/settings values so the test cannot drift
+        # back to any persisted provider state while the worker is running.
+        self.provider_config = dict(provider_config)
 
     def run(self):
         """Run provider test in background thread"""
@@ -40,8 +123,9 @@ class ProviderTestWorker(QThread):
             asyncio.set_event_loop(loop)
 
             try:
+                worker_timeout = get_provider_worker_timeout_seconds(self.provider_config)
                 success, message = loop.run_until_complete(
-                    asyncio.wait_for(self._test_provider(), timeout=15.0)
+                    asyncio.wait_for(self._test_provider(), timeout=worker_timeout)
                 )
 
                 if success:
@@ -52,8 +136,9 @@ class ProviderTestWorker(QThread):
                 self.test_completed.emit(success, message)
 
             except asyncio.TimeoutError:
-                log.log_warn(f"Provider test timeout for '{provider_name}' after 15 seconds")
-                self.test_completed.emit(False, f"Test timeout after 15 seconds")
+                worker_timeout = int(get_provider_worker_timeout_seconds(self.provider_config))
+                log.log_warn(f"Provider test timeout for '{provider_name}' after {worker_timeout} seconds")
+                self.test_completed.emit(False, f"Test timeout after {worker_timeout} seconds")
 
             except Exception as e:
                 log.log_error(f"Provider test execution failed for '{provider_name}': {e}")
@@ -82,18 +167,7 @@ class ProviderTestWorker(QThread):
         provider_name = self.provider_config.get('name', 'Unknown')
         provider_type = self.provider_config.get('provider_type', 'unknown')
 
-        registry = None
-        llm_service = None
-
         try:
-            registry = get_service_registry()
-            if not registry.is_initialized():
-                registry.initialize()
-
-            llm_service = registry.get_llm_service()
-            if not llm_service:
-                return False, "LLM service not available"
-
             from ..services.llm_providers.provider_factory import get_provider_factory
 
             factory = get_provider_factory()
@@ -101,39 +175,17 @@ class ProviderTestWorker(QThread):
 
             if not test_provider:
                 return False, f"Failed to create provider '{provider_name}'"
-
-            test_messages = [
-                ChatMessage(
-                    role=MessageRole.USER,
-                    content="This is a test, please respond with just the word: OK"
-                )
-            ]
-
-            log.log_debug(f"Sending test request to {provider_type} provider...")
-
-            from ..services.models.llm_models import ChatRequest
-            test_request = ChatRequest(
-                messages=test_messages,
-                model=test_provider.model,
-                max_tokens=test_provider.max_tokens,
-                temperature=None
+            log.log_debug(
+                f"Testing provider snapshot "
+                f"name='{provider_name}', type='{provider_type}', "
+                f"model='{self.provider_config.get('model', '')}', "
+                f"url='{self.provider_config.get('url', '')}'"
             )
 
-            response = await test_provider.chat_completion(test_request)
-
-            if response and response.content:
-                content = response.content.strip()
-                content_upper = content.upper()
-
-                log.log_debug(f"Received response: '{content}'")
-
-                if "OK" in content_upper:
-                    return True, f"Test successful! Response: '{content}'"
-                else:
-                    return True, f"Provider responded but not as expected: '{content}'"
-            else:
-                log.log_warn(f"Empty or null response from provider")
-                return False, "Provider returned empty response"
+            success = await test_provider.test_connection()
+            if success:
+                return True, "Connection test successful."
+            return False, "Connection test failed."
 
         except AuthenticationError as e:
             log.log_warn(f"Authentication error for {provider_name}: {e}")
@@ -156,6 +208,91 @@ class ProviderTestWorker(QThread):
 
         finally:
             pass
+
+
+class ProviderModelFetchWorker(QThread):
+    """Worker thread for provider model discovery."""
+
+    fetch_completed = Signal(object)
+
+    def __init__(self, provider_config):
+        super().__init__()
+        self.provider_config = dict(provider_config)
+
+    def run(self):
+        """Run provider model discovery in a background thread."""
+        provider_name = self.provider_config.get('name', 'Unknown')
+
+        try:
+            log.log_info(f"Fetching models for provider '{provider_name}'...")
+
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            try:
+                worker_timeout = get_provider_worker_timeout_seconds(self.provider_config)
+                result = loop.run_until_complete(
+                    asyncio.wait_for(self._fetch_models(), timeout=worker_timeout)
+                )
+                if not self.isInterruptionRequested():
+                    self.fetch_completed.emit(result)
+
+            except asyncio.TimeoutError:
+                from ..services.models.llm_models import ProviderModelDiscoveryResult
+                worker_timeout = int(get_provider_worker_timeout_seconds(self.provider_config))
+                if not self.isInterruptionRequested():
+                    self.fetch_completed.emit(
+                        ProviderModelDiscoveryResult.failure_result(
+                            f"Model discovery timed out after {worker_timeout} seconds."
+                        )
+                    )
+
+            except Exception as e:
+                from ..services.models.llm_models import ProviderModelDiscoveryResult
+                log.log_error(f"Model discovery failed for '{provider_name}': {e}")
+                if not self.isInterruptionRequested():
+                    self.fetch_completed.emit(
+                        ProviderModelDiscoveryResult.failure_result(
+                            f"Model discovery failed: {str(e)}"
+                        )
+                    )
+
+            finally:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    if pending:
+                        for task in pending:
+                            task.cancel()
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                except Exception as cleanup_error:
+                    log.log_debug(f"Event loop cleanup warning: {cleanup_error}")
+                finally:
+                    loop.close()
+
+        except Exception as e:
+            from ..services.models.llm_models import ProviderModelDiscoveryResult
+            log.log_error(f"Model discovery setup failed for '{provider_name}': {e}")
+            if not self.isInterruptionRequested():
+                self.fetch_completed.emit(
+                    ProviderModelDiscoveryResult.failure_result(
+                        f"Model discovery setup failed: {str(e)}"
+                    )
+                )
+
+    async def _fetch_models(self):
+        """Async method to fetch available models for the current provider config."""
+        registry = get_service_registry()
+        if not registry.is_initialized():
+            registry.initialize()
+
+        llm_service = registry.get_llm_service()
+        if not llm_service:
+            from ..services.models.llm_models import ProviderModelDiscoveryResult
+            return ProviderModelDiscoveryResult.failure_result("LLM service not available")
+
+        return await llm_service.discover_provider_models(self.provider_config)
 
 
 class MCPTestWorker(QThread):
@@ -308,6 +445,8 @@ class ProviderDialog(QDialog):
         super().__init__(parent)
         self.provider_data = provider_data
         self._pending_pkce_verifier = None
+        self.dialog_test_worker = None
+        self.fetch_models_worker = None
         self.setup_ui()
 
         if provider_data:
@@ -316,7 +455,7 @@ class ProviderDialog(QDialog):
     def setup_ui(self):
         self.setWindowTitle("LLM Provider" if not self.provider_data else f"Edit {self.provider_data.get('name', 'Provider')}")
         self.setModal(True)
-        self.resize(450, 400)
+        self.resize(450, 430)
 
         layout = QVBoxLayout()
 
@@ -345,6 +484,7 @@ class ProviderDialog(QDialog):
         self.model_combo = QComboBox()
         self.model_combo.setVisible(False)
         self.model_combo.currentTextChanged.connect(self._on_model_combo_changed)
+        self.model_combo.activated.connect(lambda _index: self._on_model_combo_changed(self.model_combo.currentText()))
         model_layout.addWidget(self.model_edit)
         model_layout.addWidget(self.fetch_models_button)
         layout.addLayout(model_layout)
@@ -361,6 +501,13 @@ class ProviderDialog(QDialog):
         self.max_tokens_spin.setRange(1, 100000)
         self.max_tokens_spin.setValue(4096)
         layout.addWidget(self.max_tokens_spin)
+
+        # Timeout
+        layout.addWidget(QLabel("Timeout (seconds):"))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(1, 3600)
+        self.timeout_spin.setValue(int(DEFAULT_PROVIDER_TIMEOUT_SECONDS))
+        layout.addWidget(self.timeout_spin)
 
         # API Key / OAuth Token
         self.api_key_label = QLabel("API Key:")
@@ -395,7 +542,7 @@ class ProviderDialog(QDialog):
         # Bypass Proxy
         self.bypass_proxy_check = QCheckBox("Bypass System Proxy")
         self.bypass_proxy_check.setToolTip("Ignore system proxy settings and connect directly (fixes 502 errors when a global proxy is active)")
-        self.bypass_proxy_check.setChecked(True)  # Default: bypass proxy
+        self.bypass_proxy_check.setChecked(False)
         layout.addWidget(self.bypass_proxy_check)
 
         # Claude Code CLI note
@@ -459,111 +606,187 @@ class ProviderDialog(QDialog):
             self.model_edit.setText(self.provider_data.get('model', ''))
             self.url_edit.setText(self.provider_data.get('url', ''))
             self.max_tokens_spin.setValue(self.provider_data.get('max_tokens', 4096))
+            self.timeout_spin.setValue(self.provider_data.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS)))
             self.key_edit.setText(self.provider_data.get('api_key', ''))
             self.disable_tls_check.setChecked(self.provider_data.get('disable_tls', False))
-            self.bypass_proxy_check.setChecked(self.provider_data.get('bypass_proxy', True))
+            self.bypass_proxy_check.setChecked(self.provider_data.get('bypass_proxy', False))
 
     def get_provider_data(self):
         """Get the provider data from the form"""
         return {
             'name': self.name_edit.text().strip(),
             'provider_type': self.provider_type_combo.currentData(),
-            'model': self.model_edit.text().strip(),
+            'model': self._get_current_model_text(),
             'url': self.url_edit.text().strip(),
             'max_tokens': self.max_tokens_spin.value(),
+            'timeout': self.timeout_spin.value(),
             'api_key': self.key_edit.text(),
             'disable_tls': self.disable_tls_check.isChecked(),
             'bypass_proxy': self.bypass_proxy_check.isChecked()
         }
+
+    def _get_current_model_text(self):
+        """Return the effective current model from the active model input control."""
+        if self.model_combo.isVisible():
+            combo_text = self.model_combo.currentText().strip()
+            if combo_text:
+                return combo_text
+        return self.model_edit.text().strip()
 
     def _on_model_combo_changed(self, text):
         """Sync combo selection back to model_edit"""
         if text:
             self.model_edit.setText(text)
 
-    def on_dialog_test_clicked(self):
-        """Send a test message to verify the provider connection"""
-        import urllib.request
-        import json
-        url = self.url_edit.text().strip().rstrip('/')
-        api_key = self.key_edit.text().strip()
-        model = self.model_edit.text().strip()
-        disable_tls = self.disable_tls_check.isChecked()
-        if not url or not model:
-            self.dialog_test_status.setText("⚠ Fill URL and Model first")
-            return
-        chat_url = url.rstrip('/') + '/chat/completions'
-        if not '/v1' in chat_url:
-            chat_url = url.rstrip('/') + '/v1/chat/completions'
-        self.dialog_test_button.setEnabled(False)
-        self.dialog_test_status.setText("Testing...")
+    def _set_dialog_test_button_enabled(self, enabled):
+        """Toggle the dialog test button between Test and Cancel modes."""
+        self.dialog_test_button.setEnabled(True)
         try:
-            body = json.dumps({"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 20}).encode()
-            req = urllib.request.Request(chat_url, data=body, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            if api_key:
-                req.add_header('Authorization', f'Bearer {api_key}')
-            if disable_tls:
-                import ssl
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                resp = urllib.request.urlopen(req, timeout=15, context=ctx)
-            else:
-                resp = urllib.request.urlopen(req, timeout=15)
-            data = json.loads(resp.read().decode())
-            content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
-            self.dialog_test_status.setText(f"✓ OK: {content[:40]}")
-        except Exception as e:
-            self.dialog_test_status.setText(f"✗ {str(e)[:50]}")
-        finally:
-            self.dialog_test_button.setEnabled(True)
+            self.dialog_test_button.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+
+        if enabled:
+            self.dialog_test_button.setText("Test")
+            self.dialog_test_button.clicked.connect(self.on_dialog_test_clicked)
+        else:
+            self.dialog_test_button.setText("Cancel")
+            self.dialog_test_button.clicked.connect(self.cancel_dialog_test)
+
+    def _set_dialog_test_status(self, status, message):
+        """Update the dialog test status message and color."""
+        self.dialog_test_status.setText(message)
+
+        if status == 'success':
+            self.dialog_test_status.setStyleSheet("color: green;")
+        elif status == 'failure':
+            self.dialog_test_status.setStyleSheet("color: red;")
+        elif status == 'testing':
+            self.dialog_test_status.setStyleSheet("color: gray;")
+        else:
+            self.dialog_test_status.setStyleSheet("")
+
+    def _stop_dialog_test_worker(self):
+        """Stop any in-flight dialog provider test worker."""
+        if self.dialog_test_worker and self.dialog_test_worker.isRunning():
+            self.dialog_test_worker.requestInterruption()
+            self.dialog_test_worker.quit()
+            self.dialog_test_worker.wait(2000)
+        self.dialog_test_worker = None
+
+    def _stop_fetch_models_worker(self):
+        """Stop any in-flight provider model discovery worker."""
+        if self.fetch_models_worker and self.fetch_models_worker.isRunning():
+            self.fetch_models_worker.requestInterruption()
+            self.fetch_models_worker.quit()
+            self.fetch_models_worker.wait(2000)
+        self.fetch_models_worker = None
+
+    def on_dialog_test_clicked(self):
+        """Run the same provider test flow used by the Settings tab."""
+        provider_data = self.get_provider_data()
+        provider_name = provider_data.get('name') or 'provider'
+
+        validation_error = validate_provider_test_config(provider_data)
+        if validation_error:
+            self._set_dialog_test_status('failure', validation_error)
+            return
+
+        self._stop_dialog_test_worker()
+        self._set_dialog_test_button_enabled(False)
+        self._set_dialog_test_status('testing', f"Testing {provider_name}...")
+
+        worker = ProviderTestWorker(provider_data)
+        self.dialog_test_worker = worker
+        worker.test_completed.connect(self.on_dialog_test_completed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_dialog_test_worker_finished)
+        worker.start()
+
+    def on_dialog_test_completed(self, success, message):
+        """Handle completion of the dialog provider test."""
+        if self.dialog_test_button.text() != "Cancel":
+            return
+
+        self._set_dialog_test_button_enabled(True)
+        self._set_dialog_test_status('success' if success else 'failure', message)
+
+    def _on_dialog_test_worker_finished(self):
+        """Clear the worker reference when the dialog test finishes."""
+        self.dialog_test_worker = None
+
+    def cancel_dialog_test(self):
+        """Cancel the in-flight provider connectivity test."""
+        self._stop_dialog_test_worker()
+        self._set_dialog_test_button_enabled(True)
+        self._set_dialog_test_status('failure', 'Test cancelled by user')
+
+    def accept(self):
+        """Close the dialog and stop any in-flight test worker."""
+        self._stop_dialog_test_worker()
+        self._stop_fetch_models_worker()
+        super().accept()
+
+    def reject(self):
+        """Close the dialog and stop any in-flight test worker."""
+        self._stop_dialog_test_worker()
+        self._stop_fetch_models_worker()
+        super().reject()
 
     def on_fetch_models_clicked(self):
-        """Fetch model list from the configured API endpoint"""
-        import urllib.request
-        import json
-        url = self.url_edit.text().strip().rstrip('/')
-        api_key = self.key_edit.text().strip()
-        disable_tls = self.disable_tls_check.isChecked()
-        if not url:
-            QMessageBox.warning(self, "拉取失败", "请先填写 URL")
+        """Fetch a model list using the provider-aware discovery flow."""
+        provider_data = self.get_provider_data()
+        validation_error = validate_provider_model_fetch_config(provider_data)
+        if validation_error:
+            QMessageBox.warning(self, "Fetch Failed", validation_error)
             return
-        models_url = url.rstrip('/v1').rstrip('/') + '/v1/models'
-        if '/v1' in url:
-            models_url = url.rstrip('/') + '/models'
+
+        self._stop_fetch_models_worker()
         self.fetch_models_button.setText("...")
         self.fetch_models_button.setEnabled(False)
-        try:
-            req = urllib.request.Request(models_url)
-            if api_key:
-                req.add_header('Authorization', f'Bearer {api_key}')
-            req.add_header('Accept', 'application/json')
-            if disable_tls:
-                import ssl
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+
+        worker = ProviderModelFetchWorker(provider_data)
+        self.fetch_models_worker = worker
+        worker.fetch_completed.connect(self.on_fetch_models_completed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_fetch_models_worker_finished)
+        worker.start()
+
+    def on_fetch_models_completed(self, result):
+        """Handle completion of provider model discovery."""
+        self.fetch_models_button.setText("Pull")
+        self.fetch_models_button.setEnabled(True)
+
+        if not result.success:
+            if result.error == "No available models were found.":
+                QMessageBox.information(self, "Fetch Results", result.error)
             else:
-                resp = urllib.request.urlopen(req, timeout=10)
-            data = json.loads(resp.read().decode())
-            models = [m['id'] for m in data.get('data', []) if 'id' in m]
-            if not models:
-                QMessageBox.information(self, "拉取结果", "未找到可用模型")
-            else:
-                self.model_combo.clear()
-                for m in models:
-                    self.model_combo.addItem(m)
-                current = self.model_edit.text().strip()
-                if current in models:
-                    self.model_combo.setCurrentText(current)
-                self.model_combo.setVisible(True)
-        except Exception as e:
-            QMessageBox.warning(self, "拉取失败", f"无法获取模型列表：{e}")
-        finally:
-            self.fetch_models_button.setText("Pull")
-            self.fetch_models_button.setEnabled(True)
+                QMessageBox.warning(self, "Fetch Failed", result.error or "Unable to fetch the model list.")
+            return
+
+        current = self._get_current_model_text()
+        models = result.models
+
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for model_name in models:
+            self.model_combo.addItem(model_name)
+
+        if current and current in models:
+            self.model_combo.setCurrentText(current)
+        elif current:
+            self.model_combo.setCurrentIndex(-1)
+        else:
+            self.model_combo.setCurrentIndex(0)
+            if models:
+                self.model_edit.setText(models[0])
+
+        self.model_combo.blockSignals(False)
+        self.model_combo.setVisible(True)
+
+    def _on_fetch_models_worker_finished(self):
+        """Clear the worker reference when model discovery finishes."""
+        self.fetch_models_worker = None
 
     def on_provider_type_changed(self):
         """Handle provider type selection change"""
@@ -574,11 +797,6 @@ class ProviderDialog(QDialog):
 
                 if not self.url_edit.text() or self.url_edit.text() in [pt.default_url for pt in ProviderType]:
                     self.url_edit.setText(provider_type.default_url)
-
-                if not self.model_edit.text():
-                    default_models = provider_type.default_models
-                    if default_models:
-                        self.model_edit.setText(default_models[0])
 
                 is_litellm = provider_type == ProviderType.LITELLM
                 self.litellm_metadata_label.setVisible(is_litellm)
@@ -1176,6 +1394,18 @@ class SettingsController(QObject):
         self.connect_signals()
         self.load_initial_data()
 
+    def _invalidate_llm_provider_cache(self, provider_name=None):
+        """Invalidate cached LLM providers after provider config changes."""
+        try:
+            registry = get_service_registry()
+            if not registry.is_initialized():
+                return
+            llm_service = registry.get_llm_service()
+            if llm_service:
+                llm_service.invalidate_provider_cache(provider_name)
+        except Exception as e:
+            log.log_debug(f"Failed to invalidate provider cache: {e}")
+
     def connect_signals(self):
         """Connect view signals to controller methods"""
         self.view.llm_provider_add_requested.connect(self.add_llm_provider)
@@ -1271,8 +1501,10 @@ class SettingsController(QObject):
                 provider_id = self.service.add_llm_provider(
                     data['name'], data['model'], data['url'],
                     data['max_tokens'], data['api_key'], data['disable_tls'], data['provider_type'],
-                    bypass_proxy=data.get('bypass_proxy', True)
+                    bypass_proxy=data.get('bypass_proxy', False),
+                    timeout=data.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS))
                 )
+                self._invalidate_llm_provider_cache(data['name'])
 
                 providers = self.service.get_llm_providers()
                 if len(providers) == 1:
@@ -1306,7 +1538,11 @@ class SettingsController(QObject):
                     self.show_error("Validation Error", "URL is required for this provider type.")
                     return
 
+                old_provider_name = provider['name']
                 self.service.update_llm_provider(provider['id'], **data)
+                self._invalidate_llm_provider_cache(old_provider_name)
+                if data['name'] != old_provider_name:
+                    self._invalidate_llm_provider_cache(data['name'])
                 self.load_initial_data()
                 self.show_info("Success", f"Updated LLM provider '{data['name']}'")
 
@@ -1326,8 +1562,10 @@ class SettingsController(QObject):
                 new_name, provider['model'], provider['url'],
                 provider['max_tokens'], provider['api_key'],
                 provider['disable_tls'], provider.get('provider_type', 'openai_platform'),
-                bypass_proxy=provider.get('bypass_proxy', True)
+                bypass_proxy=provider.get('bypass_proxy', False),
+                timeout=provider.get('timeout', int(DEFAULT_PROVIDER_TIMEOUT_SECONDS))
             )
+            self._invalidate_llm_provider_cache(new_name)
             self.load_initial_data()
             self.show_info("Success", f"Duplicated LLM provider as '{new_name}'")
         except Exception as e:
@@ -1350,6 +1588,7 @@ class SettingsController(QObject):
 
             if reply == QMessageBox.Yes:
                 self.service.delete_llm_provider(provider['id'])
+                self._invalidate_llm_provider_cache(provider['name'])
                 self.view.llm_table.removeRow(row)
                 self.view.active_provider_combo.removeItem(row)
                 self.show_info("Success", f"Deleted LLM provider '{provider['name']}'")
@@ -1364,11 +1603,9 @@ class SettingsController(QObject):
                 return
             provider = providers[row]
 
-            provider_type = provider.get('provider_type', '')
-            requires_key = provider_type not in ('ollama', 'anthropic_cli', 'openai_oauth', 'gemini_oauth')
-            if not provider.get('api_key') and requires_key:
-                self.view.set_llm_test_status('failure',
-                    f"Provider '{provider['name']}' has no API key configured.")
+            validation_error = validate_provider_test_config(provider)
+            if validation_error:
+                self.view.set_llm_test_status('failure', validation_error)
                 return
 
             self.view.set_llm_test_enabled(False)
@@ -1407,6 +1644,7 @@ class SettingsController(QObject):
         try:
             self.view.active_provider_combo.currentTextChanged.disconnect()
             success = self.service.set_active_llm_provider(provider_name)
+            self._invalidate_llm_provider_cache(provider_name)
             provider = self.service.get_active_llm_provider()
             if provider:
                 reasoning_effort = provider.get('reasoning_effort', 'none')

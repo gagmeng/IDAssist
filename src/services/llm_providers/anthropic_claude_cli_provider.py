@@ -45,9 +45,6 @@ class AnthropicClaudeCliProvider(BaseLLMProvider):
         # Claude CLI path (default: 'claude' - assumes it's in PATH)
         self.claude_path = config.get('claude_path', 'claude')
 
-        # Timeout for CLI execution (default: 5 minutes)
-        self.timeout = config.get('timeout', 300)
-
         # Model to use (sonnet, opus, haiku)
         if not self.model:
             self.model = 'sonnet'
@@ -516,7 +513,7 @@ class AnthropicClaudeCliProvider(BaseLLMProvider):
 
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=10
+                timeout=self.timeout
             )
 
             if process.returncode == 0:
@@ -529,7 +526,7 @@ class AnthropicClaudeCliProvider(BaseLLMProvider):
                 return False
 
         except asyncio.TimeoutError:
-            log.log_error("Claude CLI version check timed out")
+            log.log_error(f"Claude CLI version check timed out after {self.timeout} seconds")
             return False
         except Exception as e:
             log.log_error(f"Claude CLI test failed: {e}")

@@ -300,7 +300,11 @@ class ExplainController:
             llm_query = self._generate_llm_query(context, code_data, rag_enabled, mcp_enabled)
 
             # Track RLHF context for this query
-            self._track_rlhf_context(active_provider['name'], llm_query, "Function analysis system")
+            self._track_rlhf_context(
+                active_provider['name'],
+                llm_query,
+                self._get_explain_system_prompt()
+            )
 
             # Send to LLM and stream response
             self._query_llm_async(llm_query, active_provider)
@@ -404,7 +408,11 @@ class ExplainController:
             llm_query = self._generate_line_explanation_prompt(context, line_with_context, rag_enabled, mcp_enabled)
 
             # Track RLHF context for this query
-            self._track_rlhf_context(active_provider['name'], llm_query, "Line analysis system")
+            self._track_rlhf_context(
+                active_provider['name'],
+                llm_query,
+                self._get_explain_system_prompt()
+            )
 
             # Store line context for saving after completion
             self._pending_line_context = {
@@ -601,7 +609,11 @@ class ExplainController:
         binary_info = context["binary_info"]
 
         if include_llm_prompt:
-            explanation = ""
+            explanation = """# Function Explanation
+
+Describe the functionality of the decompiled code below. Provide a summary paragraph section followed by an analysis section that details the functionality of the code. The analysis section should be Markdown formatted. Try to identify the function name from the functionality present, or from string constants or log messages if they are present. But only fallback to strings or log messages that are clearly function names for this function. Include any other relavant details such as possible data structures and security issues,
+
+"""
         else:
             explanation = "# Function Explanation\n\n"
 
@@ -784,6 +796,23 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
 
         return prompt
 
+    def _get_explain_system_prompt(self) -> str:
+        """Get the configured system prompt for Explain queries."""
+        try:
+            return (self.settings_service.get_system_prompt() or "").strip()
+        except Exception as e:
+            log.log_warn(f"Failed to load Explain system prompt: {e}")
+            return ""
+
+    def _build_explain_messages(self, query: str) -> List[Dict[str, str]]:
+        """Build the initial message list for Explain queries."""
+        messages: List[Dict[str, str]] = []
+        system_prompt = self._get_explain_system_prompt()
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": query})
+        return messages
+
     def _query_llm_async(self, query: str, provider_config: dict):
         """Send query to LLM and stream response back to view"""
         # Clear any previous response buffer and tool execution state
@@ -798,8 +827,8 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
         self._streaming_renderer.reset()
         self.view.explain_browser.reset_streaming()
 
-        # Initialize conversation history with the user query
-        self._conversation_history = [{"role": "user", "content": query}]
+        # Initialize conversation history with system and user messages.
+        self._conversation_history = self._build_explain_messages(query)
 
         # Show LLM processing state
         self.view.set_explanation_content("*Generating AI explanation...*")
@@ -809,7 +838,7 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
 
         if mcp_tools or self.mcp_enabled:
             # Use enhanced thread with MCP support
-            messages = [{"role": "user", "content": query}]
+            messages = self._conversation_history.copy()
             self.llm_thread = ExplainLLMThread(messages, provider_config, self.llm_factory, mcp_tools)
             self.llm_thread.response_chunk.connect(self._on_llm_response_chunk)
             self.llm_thread.response_complete.connect(self._on_llm_response_complete)
@@ -820,7 +849,7 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
             self.llm_thread.start()
         else:
             # Use original thread for backward compatibility
-            self.llm_thread = LLMQueryThread(query, provider_config, self.llm_factory)
+            self.llm_thread = LLMQueryThread(self._conversation_history.copy(), provider_config, self.llm_factory)
             self.llm_thread.response_chunk.connect(self._on_llm_response_chunk)
             self.llm_thread.response_complete.connect(self._on_llm_response_complete)
             self.llm_thread.response_error.connect(self._on_llm_response_error)
@@ -1556,6 +1585,9 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
         if hasattr(self, '_line_response_buffer'):
             delattr(self, '_line_response_buffer')
 
+        # Initialize conversation history with system and user messages.
+        self._conversation_history = self._build_explain_messages(query)
+
         # Show LLM processing state in line panel
         self.view.set_line_explanation_content("*Generating AI explanation...*")
 
@@ -1564,11 +1596,11 @@ Analyze the specific instruction/line of code below. Provide a detailed explanat
 
         if mcp_tools or self.mcp_enabled:
             # Use enhanced thread with MCP support
-            messages = [{"role": "user", "content": query}]
+            messages = self._conversation_history.copy()
             self.line_llm_thread = ExplainLLMThread(messages, provider_config, self.llm_factory, mcp_tools)
         else:
             # Use original thread
-            self.line_llm_thread = LLMQueryThread(query, provider_config, self.llm_factory)
+            self.line_llm_thread = LLMQueryThread(self._conversation_history.copy(), provider_config, self.llm_factory)
 
         # Connect signals for line-specific handling
         self.line_llm_thread.response_chunk.connect(self._on_line_llm_response_chunk)
@@ -1859,9 +1891,9 @@ class LLMQueryThread(QThread):
     response_complete = Signal()
     response_error = Signal(str)
 
-    def __init__(self, query: str, provider_config: dict, llm_factory):
+    def __init__(self, messages: List[Dict[str, Any]], provider_config: dict, llm_factory):
         super().__init__()
-        self.query = query
+        self.messages = messages
         self.provider_config = provider_config
         self.llm_factory = llm_factory
         self.cancelled = False
@@ -1896,20 +1928,26 @@ class LLMQueryThread(QThread):
             if self.cancelled:
                 return
 
-            # Create chat request
-            # Merge system prompt into user message content
-            try:
-                from src.services.settings_service import settings_service as _ss
-                _sys_prompt = _ss.get_system_prompt()
-                if _sys_prompt:
-                    merged_query = _sys_prompt + '\n\n' + self.query
+            chat_messages = []
+            for msg in self.messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "system":
+                    chat_messages.append(ChatMessage(role=MessageRole.SYSTEM, content=content))
+                elif role == "assistant":
+                    chat_messages.append(ChatMessage(role=MessageRole.ASSISTANT, content=content))
+                elif role == "tool":
+                    chat_messages.append(ChatMessage(
+                        role=MessageRole.TOOL,
+                        content=content,
+                        tool_call_id=msg.get("tool_call_id"),
+                        name=msg.get("name")
+                    ))
                 else:
-                    merged_query = self.query
-            except Exception:
-                merged_query = self.query
-            messages = [ChatMessage(role=MessageRole.USER, content=merged_query)]
+                    chat_messages.append(ChatMessage(role=MessageRole.USER, content=content))
+
             request = ChatRequest(
-                messages=messages,
+                messages=chat_messages,
                 model=self.provider_config.get('model', ''),
                 stream=True,
                 max_tokens=self.provider_config.get('max_tokens', 4096)

@@ -18,7 +18,7 @@ from .models.provider_types import ProviderType
 from .models.llm_models import (
     ChatMessage, MessageRole, ChatRequest, ChatResponse,
     EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
-    ToolCall, Usage
+    ProviderModelDiscoveryResult, ToolCall, Usage
 )
 
 # Re-export provider interfaces for extensibility
@@ -61,6 +61,7 @@ __all__ = [
     'EmbeddingRequest',
     'EmbeddingResponse',
     'ProviderCapabilities',
+    'ProviderModelDiscoveryResult',
     'ToolCall',
     'Usage',
 
