@@ -821,22 +821,48 @@ class QueryController:
             if not line or line.startswith(("Summary:", "Progress:")):
                 continue
             lowered = line.lower()
-            status = "pending"
+            status = "PENDING"
             task_text = line
             if lowered.startswith(("[x]", "done", "complete")):
-                status = "completed"
-            elif lowered.startswith(("[>]", "active", "in_progress", "in progress")):
-                status = "in_progress"
-            task_text = task_text.lstrip("-* ").replace("[x]", "", 1).replace("[ ]", "", 1).replace("[>]", "", 1).strip()
+                status = "COMPLETE"
+            elif lowered.startswith(("[->]", "[>]", "active", "in_progress", "in progress")):
+                status = "IN_PROGRESS"
+            task_text = (
+                task_text.lstrip("-* ")
+                .replace("[x]", "", 1)
+                .replace("[ ]", "", 1)
+                .replace("[->]", "", 1)
+                .replace("[>]", "", 1)
+                .strip()
+            )
             tasks.append({"task": task_text, "status": status})
         return tasks
 
     def _todo_summary(self, tasks: List[Dict[str, str]]) -> str:
         total = len(tasks)
-        completed = sum(1 for task in tasks if task.get("status") == "completed")
-        active = sum(1 for task in tasks if task.get("status") == "in_progress")
-        pending = max(0, total - completed - active)
-        return f"Progress: {completed}/{total} complete | {active} active | {pending} pending"
+        completed = sum(1 for task in tasks if (task.get("status") or "").upper() == "COMPLETE")
+        return f"{completed}/{total} tasks complete"
+
+    def _normalize_react_todo_payload(self, todo_payload) -> tuple[str, List[Dict[str, str]], Optional[int], Dict[str, int]]:
+        if isinstance(todo_payload, dict):
+            tasks = list(todo_payload.get("todos") or todo_payload.get("tasks") or [])
+            summary = todo_payload.get("summary") or self._todo_summary(tasks)
+            iteration = todo_payload.get("iteration")
+            counts = {
+                "pending_count": int(todo_payload.get("pending_count", 0) or 0),
+                "in_progress_count": int(todo_payload.get("in_progress_count", 0) or 0),
+                "complete_count": int(todo_payload.get("complete_count", 0) or 0),
+                "total_count": int(todo_payload.get("total_count", len(tasks)) or len(tasks)),
+            }
+            return summary, tasks, iteration, counts
+        tasks = self._parse_react_tasks(str(todo_payload or ""))
+        counts = {
+            "pending_count": sum(1 for task in tasks if (task.get("status") or "").upper() == "PENDING"),
+            "in_progress_count": sum(1 for task in tasks if (task.get("status") or "").upper() == "IN_PROGRESS"),
+            "complete_count": sum(1 for task in tasks if (task.get("status") or "").upper() == "COMPLETE"),
+            "total_count": len(tasks),
+        }
+        return self._todo_summary(tasks), tasks, None, counts
 
     def _begin_tool_workflow(self, tool_calls: List[ToolCall]):
         if not self.current_chat_id:
@@ -1434,18 +1460,13 @@ class QueryController:
             except Exception as e:
                 log.log_error(f"Failed to persist document chat: {e}")
 
-        # Update UI on the main thread (this may be called from a worker thread)
-        from src.ida_compat import execute_on_main_thread
-
-        def _ui_update():
-            self.view.add_chat_to_history(
-                chat_id,
-                title,
-                timestamp,
-                self.DEFAULT_DOCUMENT_DOC_TYPE,
-            )
-
-        execute_on_main_thread(_ui_update)
+        # Update the history table on the view thread. This callback may come from a worker.
+        self.view.history_entry_upsert_requested.emit(
+            chat_id,
+            title,
+            timestamp,
+            self.DEFAULT_DOCUMENT_DOC_TYPE,
+        )
 
         log.log_info(f"Document chat created: '{title}' (Chat {chat_id})")
         return chat_id
@@ -2959,7 +2980,7 @@ Tool Usage Guidelines:
                     self._current_query_binary_hash,
                     str(self.current_chat_id),
                     "Tool execution stopped to prevent an infinite loop.",
-                    metadata={"phase": "loop_guard"},
+                    metadata={"category": "loop_guard"},
                 )
             else:
                 self._add_message_to_chat(self.current_chat_id, "assistant", "**Note:** Tool execution stopped to prevent infinite loop.")
@@ -3073,7 +3094,7 @@ Tool Usage Guidelines:
                     self._current_query_binary_hash,
                     str(self.current_chat_id),
                     response_content,
-                    metadata={"phase": "tool_error"},
+                    metadata={"category": "tool_error"},
                 )
                 self._refresh_transcript_view(self._active_stream_markdown or None)
             else:
@@ -3584,7 +3605,7 @@ Tool Usage Guidelines:
                     self._current_query_binary_hash,
                     str(self.current_chat_id),
                     f"Planning investigation steps for: {query_text}",
-                    metadata={"phase": "planning"},
+                    metadata={"category": "react_start"},
                 )
 
             # Update display to show the initial user query and planning notice cards.
@@ -3674,30 +3695,36 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
         self._react_thread.start()
         log.log_info("ReAct analysis thread started")
 
-    def _on_react_planning_complete(self, todos_formatted: str):
+    def _on_react_planning_complete(self, todo_payload):
         """Handle planning phase completion"""
-        log.log_debug(f"ReAct planning complete: {todos_formatted[:100]}...")
-        self._last_todo_snapshot = todos_formatted
-        self._last_react_tasks = self._parse_react_tasks(todos_formatted)
+        summary, tasks, iteration, counts = self._normalize_react_todo_payload(todo_payload)
+        log.log_debug(f"ReAct planning complete: {summary[:100]}...")
+        self._last_todo_snapshot = summary
+        self._last_react_tasks = tasks
         if self.current_chat_id and self._current_query_binary_hash:
             self.transcript_service.append_todo_snapshot(
                 self._current_query_binary_hash,
                 str(self.current_chat_id),
-                self._todo_summary(self._last_react_tasks),
-                self._last_react_tasks,
+                summary,
+                tasks,
+                iteration=iteration,
+                counts=counts,
             )
 
-    def _on_react_todos_updated(self, todos_formatted: str):
+    def _on_react_todos_updated(self, todo_payload):
         """Handle todo list updates"""
         log.log_debug(f"ReAct todos updated")
-        self._last_todo_snapshot = todos_formatted
-        self._last_react_tasks = self._parse_react_tasks(todos_formatted)
+        summary, tasks, iteration, counts = self._normalize_react_todo_payload(todo_payload)
+        self._last_todo_snapshot = summary
+        self._last_react_tasks = tasks
         if self.current_chat_id and self._current_query_binary_hash:
             self.transcript_service.append_todo_snapshot(
                 self._current_query_binary_hash,
                 str(self.current_chat_id),
-                self._todo_summary(self._last_react_tasks),
-                self._last_react_tasks,
+                summary,
+                tasks,
+                iteration=iteration,
+                counts=counts,
             )
 
     def _on_react_iteration_started(self, iteration: int, current_todo: str):
@@ -3707,8 +3734,8 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
             self.transcript_service.append_iteration_notice(
                 self._current_query_binary_hash,
                 str(self.current_chat_id),
-                current_todo,
-                metadata={"iteration": iteration, "phase": "start"},
+                f"Working on: {current_todo}" if current_todo else "Continuing investigation",
+                metadata={"iteration": iteration, "category": "iteration_start"},
             )
 
     def _on_react_iteration_complete(self, iteration: int, summary: str):
@@ -3719,17 +3746,24 @@ Current Offset: {context.get('offset_hex', 'N/A')}"""
                 self._current_query_binary_hash,
                 str(self.current_chat_id),
                 summary or f"Iteration {iteration} complete",
-                metadata={"iteration": iteration, "phase": "complete"},
+                metadata={"iteration": iteration, "category": "iteration_complete"},
             )
 
-    def _on_react_finding(self, finding: str):
+    def _on_react_finding(self, finding_payload):
         """Handle new finding discovered"""
+        if isinstance(finding_payload, dict):
+            finding = finding_payload.get("finding", "")
+            iteration = finding_payload.get("iteration")
+        else:
+            finding = str(finding_payload or "")
+            iteration = None
         log.log_debug(f"ReAct finding: {finding[:50]}...")
         if self.current_chat_id and self._current_query_binary_hash:
             self.transcript_service.append_finding(
                 self._current_query_binary_hash,
                 str(self.current_chat_id),
                 finding,
+                iteration=iteration,
             )
 
     def _on_react_progress(self, message: str, iteration: int):
